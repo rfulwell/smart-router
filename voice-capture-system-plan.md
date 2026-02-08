@@ -746,3 +746,225 @@ Open the Config Sheet on your phone → Tags tab → add a row. No redeploy need
 
 ### Check what was captured
 Open the Activity Log Sheet to see every transaction with full details.
+
+---
+
+## Detailed Implementation Breakdown
+
+Below is a granular, file-by-file breakdown of every implementation task, organized by phase. Each task specifies exactly what to build, the function signatures, key decisions, and acceptance criteria.
+
+---
+
+### Phase 1: Repo & Local Dev Setup — Detailed Tasks
+
+#### Task 1.1.1: Create `package.json`
+- **What**: Initialize with `npm init -y`, then customize
+- **Key fields**: name (`smart-router`), description, scripts (`dev`, `build`, `start`, `bootstrap`, `seed`)
+- **Dependencies**: express, @anthropic-ai/sdk, googleapis, zod, dotenv
+- **Dev dependencies**: typescript, @types/express, @types/node, tsx
+- **Acceptance**: `npm install` completes without errors
+
+#### Task 1.1.2: Create `tsconfig.json`
+- **What**: TypeScript compiler configuration
+- **Key settings**: target ES2022, module NodeNext, moduleResolution NodeNext, strict mode, outDir `dist`, rootDir `src`
+- **Acceptance**: `npx tsc --noEmit` exits cleanly
+
+#### Task 1.1.3: Create `.env.example`
+- **What**: Document every required environment variable with descriptions
+- **Sections**: Secrets (ANTHROPIC_API_KEY, GOOGLE_SERVICE_ACCOUNT_KEY, WEBHOOK_SECRET), Config IDs (CONFIG_SHEET_ID, LINKS_SHEET_ID, ACTIVITY_LOG_SHEET_ID, IDEAS_FOLDER_ID, INBOX_DOC_ID), Optional (PORT)
+- **Acceptance**: New developer can copy this and know exactly what to fill in
+
+#### Task 1.1.4: Create `.gitignore`
+- **What**: Exclude node_modules, dist, .env, source maps
+- **Acceptance**: `git status` doesn't show generated files
+
+#### Task 1.2.1: Create `src/index.ts` — Express entry point
+- **What**: Minimal Express app with JSON body parsing
+- **Routes**: mount `webhookRouter` at `/webhook`, health check at `GET /health`
+- **Port**: Read from `process.env.PORT`, default `8080` (Cloud Run convention)
+- **Imports**: `dotenv/config` at top for .env loading in local dev
+- **Acceptance**: `npm run dev` starts server, `curl localhost:8080/health` returns `ok`
+
+#### Task 1.3.1: Create `src/routes/webhook.ts` — Webhook handler
+- **What**: POST endpoint that receives voice/share input
+- **Input validation**: Zod schema for `{ text: string, source: string, timestamp?: string }`
+- **Auth**: Compare `Authorization: Bearer <secret>` header against `WEBHOOK_SECRET` env var
+- **Response pattern**: Return `200 { status: "accepted" }` immediately, then process asynchronously
+- **Processing pipeline**: classify → route to action → log activity
+- **Error handling**: On processing failure, log error to Activity Log Sheet and console
+- **Action routing**: switch on `result.action` — `save_link`, `new_idea`, `append_to_project`, default → `inbox`
+- **Acceptance**: Accepts well-formed POST, rejects missing/bad auth, rejects invalid body shapes
+
+#### Task 1.4.1: Create `Dockerfile`
+- **What**: Multi-stage Docker build for Cloud Run deployment
+- **Stage 1 (builder)**: node:20-slim, `npm ci`, `npm run build`
+- **Stage 2 (runtime)**: node:20-slim, copy only `dist/`, `node_modules/`, `package*.json`
+- **Env**: NODE_ENV=production, CMD `node dist/index.js`
+- **Acceptance**: `docker build .` succeeds, image size ~150MB
+
+---
+
+### Phase 2: Google Workspace Setup — Detailed Tasks
+
+#### Task 2.1.1: Create `src/services/auth.ts` — Google auth helper
+- **What**: Centralized Google API authentication using service account
+- **Functions**:
+  - `getAuth()` → GoogleAuth instance from base64-decoded `GOOGLE_SERVICE_ACCOUNT_KEY`
+  - `getSheetsClient()` → Google Sheets v4 client
+  - `getDocsClient()` → Google Docs v1 client
+  - `getDriveClient()` → Google Drive v3 client
+- **Scopes**: spreadsheets, documents, drive
+- **Acceptance**: All three clients can be instantiated without error when key is set
+
+#### Task 2.2.1: Create `src/services/sheets.ts` — Sheets wrapper
+- **Functions**:
+  - `readRows(sheetId: string, range: string): Promise<string[][]>` — reads a range, returns 2D array
+  - `appendRow(sheetId: string, range: string, values: string[]): Promise<void>` — appends one row
+- **Value input option**: `USER_ENTERED` for append (allows Sheets to auto-format dates)
+- **Acceptance**: Can read from and write to a test sheet
+
+#### Task 2.2.2: Create `src/services/docs.ts` — Docs wrapper
+- **Functions**:
+  - `appendSection(docId: string, content: string): Promise<void>` — appends text with separator at end of doc
+  - `createDoc(folderId: string, title: string, body: string): Promise<string>` — creates doc in folder, returns ID
+- **Implementation details**:
+  - `appendSection`: Get doc length, insert at `endIndex - 1` with `\n---\n` prefix
+  - `createDoc`: Create via Docs API, insert body text, then move to target folder via Drive API
+- **Acceptance**: Can create a new doc and append to an existing one
+
+#### Task 2.2.3: Create `src/services/drive.ts` — Drive wrapper
+- **Functions**:
+  - `createFolder(parentId: string, name: string): Promise<string>` — creates subfolder, returns ID
+- **Acceptance**: Can create a folder in Drive
+
+#### Task 2.3.1: Create `scripts/bootstrap-drive.ts` — One-time setup script
+- **What**: Creates the full Google Workspace folder/file structure
+- **Creates**:
+  1. Root folder "Voice Capture System"
+  2. Subfolder "Project Notes"
+  3. Subfolder "Project Ideas"
+  4. Subfolder "System"
+  5. Config Sheet in System (with "Projects" and "Tags" tabs, header rows)
+  6. Saved Links Sheet in System (with header row: Date, URL, Comment, Tags, Source Project, Raw Input)
+  7. Activity Log Sheet in System (with header: Timestamp, Raw Input, Source, Parsed Action, Parsed Tags, Destination, Status, Error)
+  8. Inbox Doc in System
+- **Output**: Prints all IDs formatted for copy-paste into `.env`
+- **Usage**: `npx tsx scripts/bootstrap-drive.ts`
+- **Acceptance**: Running once creates all resources, IDs are printed
+
+#### Task 2.3.2: Create `scripts/seed-config.ts` — Seed initial data
+- **What**: Populates Config Sheet with starter projects and tags
+- **Sample projects** (5): Smart Router, Personal Site, CLI Tools, Learning Notes, Side Projects
+- **Sample tags** (19): organized by category — language, framework, architecture, infrastructure, practice, topic
+- **Usage**: `npx tsx scripts/seed-config.ts`
+- **Acceptance**: Config Sheet has populated Projects and Tags tabs
+
+---
+
+### Phase 3: Classification & Routing — Detailed Tasks
+
+#### Task 3.1.1: Create `src/classifier/schema.ts` — Zod validation
+- **Schema fields**:
+  - `action`: enum `['save_link', 'new_idea', 'append_to_project', 'inbox']`
+  - `url`: `string().url().nullable()`
+  - `tags`: `array(string())`
+  - `project`: `string().nullable()`
+  - `title`: `string()`
+  - `comment`: `string()`
+  - `confidence`: `number().min(0).max(1)`
+- **Export**: Both the Zod schema and the inferred TypeScript type
+- **Acceptance**: Valid JSON parses correctly, invalid JSON throws ZodError
+
+#### Task 3.2.1: Create `src/classifier/prompt.ts` — Prompt template
+- **Exports**:
+  - `PromptContext` interface: `{ projects, tags }` with their shapes
+  - `buildSystemPrompt(context: PromptContext): string` — full system prompt with rules and few-shot examples
+  - `buildUserMessage(rawText: string, source: string): string` — prefixes input with source
+- **Prompt engineering rules**:
+  - Return ONLY valid JSON, no markdown fences
+  - Match tags from provided list, only invent new if nothing matches
+  - Reconstruct mangled URLs from voice transcription
+  - Low confidence → inbox with confidence < 0.6
+- **Few-shot examples**: 4 examples covering save_link, new_idea, append_to_project, inbox
+- **Dynamic context**: Injects available projects list and tags list from Config Sheet
+- **Acceptance**: Generated prompts are well-formed and include all context
+
+#### Task 3.3.1: Create `src/classifier/classify.ts` — Claude API integration
+- **Function**: `classify(rawText: string, source: string): Promise<CaptureAction>`
+- **Pipeline**:
+  1. Fetch registry from Config Sheet via `fetchRegistry()`
+  2. Build prompt with `buildSystemPrompt()` and `buildUserMessage()`
+  3. Call Claude Haiku API (`claude-haiku-4-5-20251001`, max_tokens 512)
+  4. Extract text from response content blocks
+  5. Parse JSON from response text
+  6. Validate with Zod `CaptureAction.parse()`
+  7. If confidence < 0.6, override action to `inbox`
+- **Error fallback**: On any failure (API error, JSON parse, Zod validation), return inbox action with raw text preserved
+- **Acceptance**: Classifies test inputs correctly, handles failures gracefully
+
+#### Task 3.4.1: Create `src/config/registry.ts` — Config Sheet reader
+- **Interface**: `Registry { projects: [...], tags: [...] }`
+- **Function**: `fetchRegistry(): Promise<Registry>`
+- **Reads**: Config Sheet's "Projects" tab (A2:D) and "Tags" tab (A2:B) in parallel
+- **Maps**: Row arrays to typed objects with named fields
+- **Acceptance**: Returns structured registry from sheet data
+
+#### Task 3.5.1: Create `src/logger.ts` — Activity logger
+- **Function**: `logActivity(rawInput, source, result, status, errorMessage?): Promise<void>`
+- **Writes to**: Activity Log Sheet, range `Sheet1!A:H`
+- **Columns**: Timestamp (ISO), Raw Input, Source, Parsed Action, Parsed Tags (comma-joined), Destination (human-readable), Status, Error
+- **Destination helper**: Maps action type to readable string (e.g., "Links Sheet", "Ideas Folder: {title}")
+- **Error resilience**: Catches and logs errors to console, never throws (logging should not break the main flow)
+- **Acceptance**: Every webhook call results in a new activity log row
+
+#### Task 3.6.1: Create `src/actions/save-link.ts`
+- **Function**: `saveLink(result: CaptureAction, rawInput: string): Promise<void>`
+- **Appends row to**: Links Sheet, columns: Date (ISO), URL, Comment, Tags (comma-joined), Source Project, Raw Input
+- **Acceptance**: Links sheet gets a new row with all fields populated
+
+#### Task 3.6.2: Create `src/actions/new-idea.ts`
+- **Function**: `newIdea(result: CaptureAction): Promise<void>`
+- **Creates**: New Google Doc in Ideas folder with title from LLM, body with title/tags/date/comment
+- **Side effect**: Registers the new idea in Config Sheet's Projects tab (name, docId, status "idea", description)
+- **Acceptance**: New doc appears in Ideas folder, new row in Projects tab
+
+#### Task 3.6.3: Create `src/actions/append-project.ts`
+- **Function**: `appendToProject(result: CaptureAction): Promise<void>`
+- **Looks up**: Project Doc ID from registry (case-insensitive match on project name)
+- **Appends**: Timestamped section with tags and comment to the project's Google Doc
+- **Error**: Throws if project not found in registry or has no Doc ID
+- **Acceptance**: Existing project doc gets a new timestamped section
+
+#### Task 3.6.4: Create `src/actions/inbox.ts`
+- **Function**: `inbox(result: CaptureAction, rawInput: string, source: string): Promise<void>`
+- **Appends to**: Inbox Doc with timestamp, source, confidence, suggested action, tags, raw input, and parsed comment
+- **Acceptance**: Inbox doc gets a new section with all available context
+
+---
+
+### Phase 4: Deploy Pipeline — Detailed Tasks
+
+#### Task 4.1.1: Create `.github/workflows/deploy.yml`
+- **Trigger**: Push to `main` branch
+- **Permissions**: contents read, id-token write (for Workload Identity Federation)
+- **Steps**:
+  1. Checkout code
+  2. Authenticate to GCP via Workload Identity Federation
+  3. Setup gcloud CLI
+  4. Build Docker image tagged with git SHA
+  5. Push image to Artifact Registry (`us-central1-docker.pkg.dev`)
+  6. Deploy to Cloud Run with env vars and secrets
+- **Secrets referenced**: GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT, GCP_PROJECT_ID, and all config IDs
+- **Cloud Run config**: us-central1, managed platform, allow-unauthenticated, secrets from Secret Manager
+- **Acceptance**: Push to main triggers build and deploy
+
+---
+
+### Implementation Status
+
+- [x] Phase 1: Repo & Local Dev Setup — **COMPLETE**
+- [x] Phase 2: Google Workspace Setup (code) — **COMPLETE** (manual GCP setup still needed)
+- [x] Phase 3: Classification & Routing — **COMPLETE**
+- [x] Phase 4: Deploy Pipeline — **COMPLETE** (manual GCP/GitHub secrets setup still needed)
+- [ ] Phase 5: Connect Input Sources — requires manual IFTTT + HTTP Shortcuts configuration
+- [ ] Phase 6: Polish & Extend — ongoing future work
