@@ -1,7 +1,10 @@
 name: Bootstrap Google Workspace
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [claude/expand-plan-implement-ZFqMx]
+    paths:
+      - '.github/workflows/bootstrap.yml'
 
 jobs:
   bootstrap:
